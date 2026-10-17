@@ -1,0 +1,16 @@
+{
+  "name": "pingroom-starter-attachment-inbox",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "connect": "node src/connect.js",
+    "start": "node src/main.js",
+    "demo": "node src/demo.js",
+    "test": "node --test"
+  },
+  "dependencies": { "@pingroom/sdk": "0.6.0" },
+  "license": "MIT",
+  "repository": "https://github.com/pingroom/starter-attachment-inbox.git"
+}
