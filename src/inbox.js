@@ -1,6 +1,8 @@
 import { lstat, mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import { acquireLock, atomicJson, readBytes, readJson } from './storage.js';
 import { requireId, roomCode, sha256 } from './config.js';
 
@@ -35,41 +37,69 @@ export function snapshotNotification(notification, { notificationId, room, sende
   return { id: requireId(n.id), room: roomCode(room), room_id: requireId(n.room_id), sender_id: requireId(senderId), created_at: n.created_at, attachments };
 }
 
+async function abortableOperation(signal, operation) {
+  signal.throwIfAborted();
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    // Install both rejection handlers before invoking a potentially synchronous
+    // operation. Each settled operation releases its own abort wait.
+    return await Promise.race([Promise.resolve().then(() => {
+      signal.throwIfAborted();
+      return operation();
+    }), aborted]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
 // The SDK bounds the headers request. This deadline also covers the entire body.
 export async function downloadAttachment(client, attachment, { timeoutMs = 15_000, signal } = {}) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw new Error('Invalid download timeout.');
   signal?.throwIfAborted();
   const controller = new AbortController();
   const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-  let rejectAbort;
-  const aborted = new Promise((_, reject) => { rejectAbort = reject; });
-  const onAbort = () => rejectAbort(combined.reason);
-  combined.addEventListener('abort', onAbort, { once: true });
-  const timer = setTimeout(() => controller.abort(new Error('Attachment download timed out.')), timeoutMs);
+  const deadline = performance.now() + timeoutMs;
+  const timeOut = () => controller.abort(new Error('Attachment download timed out.'));
+  const checkActive = () => {
+    if (performance.now() >= deadline) timeOut();
+    combined.throwIfAborted();
+  };
+  const timer = setTimeout(timeOut, timeoutMs);
   let reader;
   let response;
   try {
-    response = await Promise.race([client.attachments.content(attachment.id, combined), aborted]);
+    response = await abortableOperation(combined, () => client.attachments.content(attachment.id, combined));
+    checkActive();
     if (response.status !== 200 || response.headers.get('content-length') !== String(attachment.size_bytes)
       || response.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== attachment.mime_type
       || !response.body) throw new Error('Attachment response headers do not match its metadata.');
     reader = response.body.getReader();
     const chunks = [];
     let length = 0;
+    let reads = 0;
     while (true) {
-      const { value, done } = await Promise.race([reader.read(), aborted]);
-      combined.throwIfAborted();
+      const { value, done } = await abortableOperation(combined, () => reader.read());
+      checkActive();
       if (done) break;
       if (!(value instanceof Uint8Array)) throw new Error('Invalid attachment body chunk.');
       length += value.byteLength;
       if (length > attachment.size_bytes || length > MAX_FILE_BYTES) throw new Error('Attachment body exceeds its declared size.');
-      chunks.push(value);
+      if (value.byteLength) chunks.push(value);
+      // Ready reads can otherwise starve timers and external cancellation.
+      // Empty chunks still count toward yielding, but consume no saved space.
+      if (++reads % 64 === 0) {
+        await yieldToEventLoop();
+        checkActive();
+      }
     }
     if (length !== attachment.size_bytes) throw new Error('Attachment body is truncated.');
     return Buffer.concat(chunks, length);
   } finally {
     clearTimeout(timer);
-    combined.removeEventListener('abort', onAbort);
     if (reader) void reader.cancel().catch(() => {});
     else if (response?.body) void response.body.cancel().catch(() => {});
   }

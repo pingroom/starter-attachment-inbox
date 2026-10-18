@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { receive, MAX_FILE_BYTES } from '../src/inbox.js';
+import { performance } from 'node:perf_hooks';
+import { receive, downloadAttachment, MAX_FILE_BYTES } from '../src/inbox.js';
 import { content, notification, offlineClient, NOTIFICATION_ID, FILE_ID, SENDER_ID, ROOM } from '../src/offline.js';
 import { loadConnection, requestedRoom, saveConnection, selectRoom } from '../src/config.js';
 
@@ -89,6 +90,134 @@ test('a stalled body is stopped by the full download deadline', async (t) => {
   const { options, directory } = await setup(t, { respond: () => new Response(new ReadableStream({ pull() {} }), { headers: { 'content-type': 'text/plain', 'content-length': String(content.length) } }) });
   await assert.rejects(receive({ ...options, timeoutMs: 20 }), /timed out/);
   assert.deepEqual(await readdir(directory), []);
+});
+
+for (const emptyChunks of [false, true]) {
+  test(`elapsed deadline rejects immediately ready ${emptyChunks ? 'empty' : 'data'} chunks before publishing`, async (t) => {
+    let clock = 0;
+    let pulls = 0;
+    let cancelled = false;
+    t.mock.method(performance, 'now', () => clock);
+    const { options, directory } = await setup(t, { respond: () => new Response(new ReadableStream({
+      pull(controller) {
+        pulls += 1;
+        // Advance a monotonic clock without waiting for the timer callback.
+        // The finite fallback makes the old implementation fail, not hang.
+        clock += 250;
+        if (emptyChunks && pulls <= 8) controller.enqueue(new Uint8Array());
+        else if (pulls === (emptyChunks ? 9 : 1)) {
+          clock += 1000;
+          controller.enqueue(content);
+        } else controller.close();
+      },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 }), { headers: { 'content-type': 'text/plain', 'content-length': String(content.length) } }) });
+    await assert.rejects(receive({ ...options, timeoutMs: 1000 }), /timed out/);
+    assert.equal(cancelled, true);
+    assert.deepEqual(await readdir(directory), []);
+  });
+}
+
+test('ready empty chunks yield to external cancellation before the body finishes', async (t) => {
+  const controller = new AbortController();
+  const reason = new Error('Cancelled during ready chunks');
+  const maximumPulls = 4096;
+  let pulls = 0;
+  let cancelled = false;
+  let scheduled;
+  t.after(() => clearImmediate(scheduled));
+  const { client } = offlineClient({ respond: () => new Response(new ReadableStream({
+    pull(stream) {
+      if (pulls++ === 0) scheduled = setImmediate(() => controller.abort(reason));
+      if (pulls < maximumPulls) stream.enqueue(new Uint8Array());
+      else if (pulls === maximumPulls) stream.enqueue(content);
+      else stream.close();
+    },
+    cancel() { cancelled = true; },
+  }, { highWaterMark: 0 }), { headers: { 'content-type': 'text/plain', 'content-length': String(content.length) } }) });
+  await assert.rejects(downloadAttachment(client, notification().attachments[0], { signal: controller.signal }), (error) => error === reason);
+  assert.equal(cancelled, true);
+  assert.ok(pulls < maximumPulls);
+});
+
+test('empty chunks between data chunks do not change saved bytes', async (t) => {
+  const pieces = [new Uint8Array(), content.subarray(0, 5), new Uint8Array(), content.subarray(5), new Uint8Array()];
+  const { options } = await setup(t, { respond: () => new Response(new ReadableStream({
+    pull(controller) {
+      if (pieces.length) controller.enqueue(pieces.shift());
+      else controller.close();
+    },
+  }), { headers: { 'content-type': 'text/plain', 'content-length': String(content.length) } }) });
+  const result = await receive(options);
+  assert.deepEqual(await readFile(join(result.directory, `${FILE_ID}.bin`)), content);
+});
+
+test('each ready read releases its abort wait before starting the next read', async (t) => {
+  const add = AbortSignal.prototype.addEventListener;
+  const remove = AbortSignal.prototype.removeEventListener;
+  const listeners = new Set();
+  let adds = 0;
+  let removes = 0;
+  let pulls = 0;
+  t.mock.method(AbortSignal.prototype, 'addEventListener', function (type, listener, options) {
+    if (type === 'abort') { listeners.add(listener); adds += 1; }
+    return add.call(this, type, listener, options);
+  });
+  t.mock.method(AbortSignal.prototype, 'removeEventListener', function (type, listener, options) {
+    if (type === 'abort') { listeners.delete(listener); removes += 1; }
+    return remove.call(this, type, listener, options);
+  });
+  const client = { attachments: { content: () => new Response(new ReadableStream({
+    pull(stream) {
+      pulls += 1;
+      assert.equal(listeners.size, 1);
+      assert.equal(removes, pulls, 'headers and previous reads must release their abort waits');
+      if (pulls <= 256) stream.enqueue(new Uint8Array());
+      else if (pulls === 257) stream.enqueue(content);
+      else stream.close();
+    },
+  }, { highWaterMark: 0 }), { headers: { 'content-type': 'text/plain', 'content-length': String(content.length) } }) } };
+  assert.deepEqual(await downloadAttachment(client, notification().attachments[0]), content);
+  assert.equal(listeners.size, 0);
+  assert.equal(adds, pulls + 1);
+  assert.equal(removes, adds);
+});
+
+test('synchronous operation errors and cancellation do not leave unhandled rejections', async () => {
+  const failure = new Error('Synchronous content failure');
+  await assert.rejects(downloadAttachment({ attachments: { content() { throw failure; } } }, notification().attachments[0]), (error) => error === failure);
+  const controller = new AbortController();
+  const reason = new Error('Cancelled while creating the content operation');
+  const client = { attachments: { content() {
+    controller.abort(reason);
+    return Promise.reject(new Error('Content failed after cancellation'));
+  } } };
+  await assert.rejects(downloadAttachment(client, notification().attachments[0], { signal: controller.signal }), (error) => error === reason);
+  let called = false;
+  await assert.rejects(downloadAttachment({ attachments: { content() { called = true; } } }, notification().attachments[0], { signal: controller.signal }), (error) => error === reason);
+  assert.equal(called, false);
+  // Let Node's test runner detect any rejection left behind after cancellation.
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
+test('cancellation handles a pending read that rejects afterward', async () => {
+  const controller = new AbortController();
+  const reason = new Error('Cancelled during a pending read');
+  let rejectRead;
+  let cancelled = false;
+  const reader = {
+    read: () => new Promise((_, reject) => { rejectRead = reject; controller.abort(reason); }),
+    async cancel() { cancelled = true; },
+  };
+  const client = { attachments: { content: async () => ({
+    status: 200,
+    headers: new Headers({ 'content-type': 'text/plain', 'content-length': String(content.length) }),
+    body: { getReader: () => reader },
+  }) } };
+  await assert.rejects(downloadAttachment(client, notification().attachments[0], { signal: controller.signal }), (error) => error === reason);
+  assert.equal(cancelled, true);
+  rejectRead(new Error('Read failed after cancellation'));
+  await new Promise((resolve) => setImmediate(resolve));
 });
 
 test('external abort cancels an active body and removes staging', async (t) => {
